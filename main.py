@@ -270,7 +270,10 @@ def save_data(data):
 def card_html(rank, w):
     score = f"{w['score']:.1f}"
     start = f'<span class="start">放送開始：{html.escape(w["start"])}</span>' if w["start"] else ""
-    syn = f'<p class="desc">{html.escape(w["synopsis"])}</p>' if w["synopsis"] else ""
+    syn = ""
+    if w["synopsis"]:
+        syn = (f'<p class="desc clamp">{html.escape(w["synopsis"])}</p>'
+               '<button type="button" class="more-btn" hidden>もっと見る</button>')
     thumb = ""
     if w.get("image"):
         thumb = (f'<div class="thumb"><img src="{html.escape(w["image"], quote=True)}" '
@@ -425,6 +428,25 @@ h1 .accent { color: var(--accent); }
 .card h2 a { color: var(--text); text-decoration: none; }
 .card h2 a:hover { color: var(--accent); text-decoration: underline; }
 .desc { margin: 8px 0 0; color: var(--sub); font-size: 0.92rem; }
+.desc.clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.more-btn {
+  margin-top: 6px;
+  padding: 2px 14px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.more-btn:hover { border-color: var(--accent); }
 footer { margin-top: 40px; color: var(--muted); font-size: 0.78rem; text-align: center; }
 @media (max-width: 560px) {
   .wrap { padding: 0 12px 40px; }
@@ -468,9 +490,9 @@ function esc(s) {
 }
 function card(w) {
   var start = w.start ? '<span class="start">放送開始：' + esc(w.start) + '</span>' : '';
-  var syn = w.synopsis ? '<p class="desc">' + esc(w.synopsis) + '</p>' : '';
+  var syn = w.synopsis ? '<p class="desc clamp">' + esc(w.synopsis) + '</p><button type="button" class="more-btn" hidden>もっと見る</button>' : '';
   var thumb = w.image ? '<div class="thumb"><img src="' + esc(w.image) + '" alt="' + esc(w.title)
-    + '" loading="lazy" onerror="this.parentNode.style.display=\'none\'"></div>' : '';
+    + '" loading="lazy" onerror="this.parentNode.remove()"></div>' : '';
   return '<article class="card">' + thumb + '<div class="card-body"><div class="meta"><span class="rank">' + w.rank + '位</span>'
     + '<span class="badge badge-score">スコア ' + Number(w.score).toFixed(1) + '</span>'
     + '<span class="badge badge-rev">評価レビュー ' + w.reviews + '件</span>' + start + '</div>'
@@ -490,7 +512,35 @@ function show(key) {
   title.textContent = s.label + 'アニメ 面白さランキング';
   meta.textContent = '全' + s.total + '作品から、評価レビューFLOOR件以上の上位' + s.works.length + '作品（データ取得：' + s.fetched + '）';
   list.innerHTML = s.works.map(card).join('');
+  initClamps();
 }
+function initClamps() {
+  var nodes = document.querySelectorAll('#list .desc.clamp');
+  for (var i = 0; i < nodes.length; i++) {
+    var p = nodes[i];
+    var btn = p.parentNode.querySelector('.more-btn');
+    if (!btn) continue;
+    var clampedH = p.clientHeight;
+    p.classList.remove('clamp');
+    var fullH = p.clientHeight;
+    p.classList.add('clamp');
+    btn.hidden = !(fullH > clampedH + 2);
+  }
+}
+document.getElementById('list').addEventListener('click', function(e) {
+  var btn = (e.target && e.target.closest) ? e.target.closest('.more-btn') : null;
+  if (!btn) return;
+  var p = btn.parentNode.querySelector('.desc');
+  if (!p) return;
+  if (p.classList.contains('clamp')) {
+    p.classList.remove('clamp');
+    btn.textContent = '閉じる';
+  } else {
+    p.classList.add('clamp');
+    btn.textContent = 'もっと見る';
+  }
+});
+window.addEventListener('resize', initClamps);
 function onPick() {
   var y = document.getElementById('yearSel').value;
   var s = document.getElementById('seasonSel').value;
