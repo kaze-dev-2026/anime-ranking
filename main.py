@@ -272,13 +272,20 @@ def card_html(rank, w):
     start = f'<span class="start">放送開始：{html.escape(w["start"])}</span>' if w["start"] else ""
     syn = ""
     if w["synopsis"]:
+        # ボタンは場所を常に確保し、表示・非表示は visibility で切り替える
+        # （高さが変わるとスクロール中にページが飛ぶため）。最初から出すか
+        # どうかは文字数の目安で決め、最終判定はページ側の実寸測定で行う。
+        btn_cls = "more-btn show" if len(w["synopsis"]) > 100 else "more-btn"
         syn = (f'<p class="desc clamp">{html.escape(w["synopsis"])}</p>'
-               '<button type="button" class="more-btn" hidden>もっと見る</button>')
+               f'<button type="button" class="{btn_cls}">もっと見る</button>')
     thumb = ""
     if w.get("image"):
+        # 失敗時は画像だけを透明にし、箱（.thumb）は残す。箱ごと消すと
+        # 本文の幅が変わって高さがずれ、スクロール位置が飛ぶため。
         thumb = (f'<div class="thumb"><img src="{html.escape(w["image"], quote=True)}" '
-                 f'alt="{html.escape(w["title"], quote=True)}" loading="lazy" '
-                 f'onerror="this.parentNode.style.display=\'none\'"></div>')
+                 f'alt="{html.escape(w["title"], quote=True)}" width="300" height="420" '
+                 f'loading="lazy" decoding="async" '
+                 f'onerror="this.style.visibility=\'hidden\'"></div>')
     return (
         f'<article class="card">{thumb}<div class="card-body">'
         f'<div class="meta"><span class="rank">{rank}位</span>'
@@ -411,15 +418,21 @@ h1 .accent { color: var(--accent); }
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
 }
 .card-body { flex: 1 1 auto; min-width: 0; }
-.thumb { flex: 0 0 auto; }
-.thumb img {
-  display: block;
+.thumb {
+  flex: 0 0 auto;
   width: 88px;
   height: 123px;
-  object-fit: cover;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: #22222c;
+  overflow: hidden;
+}
+.thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  aspect-ratio: 300 / 420;
 }
 .meta { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .meta .rank { font-weight: 900; font-size: 1.05rem; color: var(--accent); margin-right: 4px; }
@@ -445,14 +458,49 @@ h1 .accent { color: var(--accent); }
   font-size: 0.8rem;
   font-weight: 700;
   cursor: pointer;
+  visibility: hidden;
 }
+.more-btn.show { visibility: visible; }
 .more-btn:hover { border-color: var(--accent); }
 footer { margin-top: 40px; color: var(--muted); font-size: 0.78rem; text-align: center; }
+.thumb img { cursor: zoom-in; }
+#lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#lightbox[hidden] { display: none; }
+#lightbox img {
+  max-width: 92vw;
+  max-height: 88vh;
+  object-fit: contain;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  cursor: zoom-out;
+}
+#lightboxClose {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(22, 22, 29, 0.92);
+  color: var(--text);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
 @media (max-width: 560px) {
   .wrap { padding: 0 12px 40px; }
   header { padding: 22px 0 18px; }
   .card { padding: 14px 16px 12px; border-radius: 10px; gap: 12px; }
-  .thumb img { width: 68px; height: 95px; }
+  .thumb { width: 68px; height: 95px; }
   .card h2 { font-size: 1.03rem; }
   .meta .start { margin-left: 0; }
 }
@@ -480,6 +528,10 @@ INITIAL
 </main>
 <footer>このページはプログラムが自動で作成しています。点数とあらすじはFilmarksの公開データに基づきます。</footer>
 </div>
+<div id="lightbox" hidden>
+<img id="lightboxImg" alt="">
+<button type="button" id="lightboxClose" aria-label="閉じる">×</button>
+</div>
 <script>
 var DATA = EMBED;
 var CUR = "CURKEY";
@@ -490,9 +542,10 @@ function esc(s) {
 }
 function card(w) {
   var start = w.start ? '<span class="start">放送開始：' + esc(w.start) + '</span>' : '';
-  var syn = w.synopsis ? '<p class="desc clamp">' + esc(w.synopsis) + '</p><button type="button" class="more-btn" hidden>もっと見る</button>' : '';
+  var btnCls = w.synopsis && w.synopsis.length > 100 ? 'more-btn show' : 'more-btn';
+  var syn = w.synopsis ? '<p class="desc clamp">' + esc(w.synopsis) + '</p><button type="button" class="' + btnCls + '">もっと見る</button>' : '';
   var thumb = w.image ? '<div class="thumb"><img src="' + esc(w.image) + '" alt="' + esc(w.title)
-    + '" loading="lazy" onerror="this.parentNode.remove()"></div>' : '';
+    + '" width="300" height="420" loading="lazy" decoding="async" onerror="this.style.visibility=\\'hidden\\'"></div>' : '';
   return '<article class="card">' + thumb + '<div class="card-body"><div class="meta"><span class="rank">' + w.rank + '位</span>'
     + '<span class="badge badge-score">スコア ' + Number(w.score).toFixed(1) + '</span>'
     + '<span class="badge badge-rev">評価レビュー ' + w.reviews + '件</span>' + start + '</div>'
@@ -524,7 +577,9 @@ function initClamps() {
     p.classList.remove('clamp');
     var fullH = p.clientHeight;
     p.classList.add('clamp');
-    btn.hidden = !(fullH > clampedH + 2);
+    // 表示・非表示は visibility のみで切り替える（高さは変えない）
+    if (fullH > clampedH + 2) btn.classList.add('show');
+    else btn.classList.remove('show');
   }
 }
 document.getElementById('list').addEventListener('click', function(e) {
@@ -540,6 +595,50 @@ document.getElementById('list').addEventListener('click', function(e) {
     btn.textContent = 'もっと見る';
   }
 });
+// ポスター拡大表示（ページ内の仕組みのみ）。季節切り替えで作り直された
+// カードでも効くよう、サムネイルのクリックは #list への委任で受ける。
+// 閉じる操作は、拡大画面のどこを押しても（画像・背景・閉じるボタン）
+// 拡大画面側のクリックで受ける。
+var lightbox = document.getElementById('lightbox');
+var lightboxImg = document.getElementById('lightboxImg');
+var lbScrollY = 0;
+function openLightbox(img) {
+  if (img.style.visibility === 'hidden') return; // 読み込み失敗の画像は開かない
+  lbScrollY = window.scrollY;
+  lightboxImg.src = img.src;
+  lightboxImg.alt = img.alt || '';
+  lightbox.hidden = false;
+  // 背面のスクロール止め。overflow だけでは止まらない環境があるため、
+  // body を現在の表示位置で固定する（閉じる時に位置を戻す）
+  document.documentElement.style.overflow = 'hidden';
+  var b = document.body;
+  b.style.overflow = 'hidden';
+  b.style.position = 'fixed';
+  b.style.top = (-lbScrollY) + 'px';
+  b.style.left = '0';
+  b.style.right = '0';
+}
+function closeLightbox() {
+  if (lightbox.hidden) return;
+  lightbox.hidden = true;
+  lightboxImg.removeAttribute('src');
+  var b = document.body;
+  document.documentElement.style.overflow = '';
+  b.style.overflow = '';
+  b.style.position = '';
+  b.style.top = '';
+  b.style.left = '';
+  b.style.right = '';
+  window.scrollTo(0, lbScrollY);
+}
+document.getElementById('list').addEventListener('click', function(e) {
+  var img = (e.target && e.target.closest) ? e.target.closest('.thumb img') : null;
+  if (img) openLightbox(img);
+});
+lightbox.addEventListener('click', function() { closeLightbox(); });
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeLightbox();
+});
 window.addEventListener('resize', initClamps);
 function onPick() {
   var y = document.getElementById('yearSel').value;
@@ -552,7 +651,11 @@ document.getElementById('seasonSel').addEventListener('change', onPick);
   var parts = CUR.split('-');
   document.getElementById('yearSel').value = parts[0];
   document.getElementById('seasonSel').value = parts[1];
-  show(CUR);
+  // 初期表示分は生成済みHTMLがそのまま入っているので、作り直さず
+  // ボタンの表示判定だけ行う（作り直すと表示が一瞬組み替わり、
+  // スクロール位置がずれる原因になるため）
+  if (document.getElementById('list').children.length) initClamps();
+  else show(CUR);
 })();
 </script>
 </body>
