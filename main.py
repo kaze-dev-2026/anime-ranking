@@ -103,12 +103,40 @@ def fetch_detail(url):
     return buf.decode("utf-8", "replace")
 
 
+def _parse_list_images(text):
+    """一覧ページの各作品ブロックから、作品パス→ポスター画像URLの対応を取る。
+
+    各作品のブロック先頭にある onClickDetailLink の引数（作品パス）と、
+    そのブロック内の最初のポスター画像（cloudfront の variants）を対応付ける。
+    ポスターが無い作品（プレースホルダ表示）は variants のURLが無いため、
+    対応表に入らない（＝画像なしとして扱う）。
+    """
+    imgmap = {}
+    pat = re.compile(
+        r"onClickDetailLink\(\$event, (?:&#39;|')(/animes/\d+/\d+)(?:&#39;|')\)")
+    clicks = [(m.start(), m.group(1)) for m in pat.finditer(text)]
+    for i, (pos, path) in enumerate(clicks):
+        end = clicks[i + 1][0] if i + 1 < len(clicks) else len(text)
+        m = re.search(
+            r'<img[^>]+src="(https://[^"]+\.cloudfront\.net/variants/[^"]+)"',
+            text[pos:end])
+        if m and path not in imgmap:
+            imgmap[path] = m.group(1)
+    return imgmap
+
+
 def fetch_season_work_urls(year, season):
-    """季節の一覧ページ（ページ送り含む）から作品ページのURL一覧を集める。"""
+    """季節の一覧ページ（ページ送り含む）から作品URL一覧と画像対応表を集める。
+
+    戻り値: (作品ページURLのリスト, {作品URL: ポスター画像URL})
+    画像は一覧ページ側から取る（詳細ページの JSON-LD にも image があるが、
+    一覧で取れば追加の取得なしに済む）。
+    """
     month = SEASON_MONTH[season]
     base_url = f"{SITE}/list-anime/release_year/{year}/{month}"
     urls = []
     seen = set()
+    imgmap = {}
     for page in range(1, 13):
         url = base_url if page == 1 else f"{base_url}?page={page}"
         try:
@@ -117,6 +145,8 @@ def fetch_season_work_urls(year, season):
             if e.code == 404 and page > 1:
                 break  # 最終ページを過ぎたら404になるため、そこで終わりとする
             raise
+        for path, img in _parse_list_images(text).items():
+            imgmap.setdefault(SITE + path, img)
         found = re.findall(r'href="(/animes/\d+/\d+)"', text)
         new = 0
         for f in found:
@@ -127,7 +157,7 @@ def fetch_season_work_urls(year, season):
         if new == 0:
             break
         time.sleep(SLEEP_SEC)
-    return urls
+    return urls, imgmap
 
 
 def _find_tvseason(obj):
@@ -149,7 +179,7 @@ def _find_tvseason(obj):
 def parse_detail(text, url):
     """作品ページの JSON-LD から、題名・点数・評価レビュー件数・あらすじ・開始日を取る。"""
     work = {"url": url, "title": "", "score": None, "reviews": 0,
-            "synopsis": "", "start": ""}
+            "synopsis": "", "start": "", "image": ""}
     for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>',
                          text, re.S):
         try:
@@ -160,6 +190,11 @@ def parse_detail(text, url):
         if not tv:
             continue
         work["title"] = (tv.get("title") or "").strip()
+        img = tv.get("image")
+        if isinstance(img, dict):
+            work["image"] = (img.get("url") or "").strip()
+        elif isinstance(img, str):
+            work["image"] = img.strip()
         work["synopsis"] = re.sub(r"\s+", " ", (tv.get("outline") or "")).strip()
         sd = tv.get("startDate") or tv.get("releaseDate") or ""
         work["start"] = sd[:10]
@@ -190,7 +225,7 @@ def _safe_one(fn, u, lines):
 
 def fetch_season(year, season, lines):
     """1季節分を取得する。失敗したら例外を投げる（呼び出し側で旧データを残す）。"""
-    urls = fetch_season_work_urls(year, season)
+    urls, imgmap = fetch_season_work_urls(year, season)
     log(lines, f"{season_label(year, season)}: 一覧から{len(urls)}作品")
     works = []
     fails = 0
@@ -204,6 +239,8 @@ def fetch_season(year, season, lines):
         results = list(ex.map(lambda u: (u, _safe_one(_one, u, lines)), urls))
     for u, w in results:
         if w is not None and w["title"]:
+            if not w.get("image"):
+                w["image"] = imgmap.get(u, "")
             works.append(w)
         else:
             fails += 1
@@ -234,14 +271,19 @@ def card_html(rank, w):
     score = f"{w['score']:.1f}"
     start = f'<span class="start">放送開始：{html.escape(w["start"])}</span>' if w["start"] else ""
     syn = f'<p class="desc">{html.escape(w["synopsis"])}</p>' if w["synopsis"] else ""
+    thumb = ""
+    if w.get("image"):
+        thumb = (f'<div class="thumb"><img src="{html.escape(w["image"], quote=True)}" '
+                 f'alt="{html.escape(w["title"], quote=True)}" loading="lazy" '
+                 f'onerror="this.parentNode.style.display=\'none\'"></div>')
     return (
-        f'<article class="card">'
+        f'<article class="card">{thumb}<div class="card-body">'
         f'<div class="meta"><span class="rank">{rank}位</span>'
         f'<span class="badge badge-score">スコア {score}</span>'
         f'<span class="badge badge-rev">評価レビュー {w["reviews"]}件</span>'
         f'{start}</div>'
         f'<h2><a href="{html.escape(w["url"], quote=True)}">{html.escape(w["title"])}</a></h2>'
-        f'{syn}</article>')
+        f'{syn}</div></article>')
 
 
 def write_html(data, cur_key):
@@ -259,7 +301,8 @@ def write_html(data, cur_key):
                     "works": [{"rank": i + 1, "title": w["title"],
                                "score": w["score"], "reviews": w["reviews"],
                                "synopsis": w["synopsis"], "url": w["url"],
-                               "start": w["start"]}
+                               "start": w["start"],
+                               "image": w.get("image", "")}
                               for i, w in enumerate(ranked)]}
     years = sorted({seasons[k]["year"] for k in keys}, reverse=True)
     year_opts = "".join(f'<option value="{y}">{y}年</option>' for y in years)
@@ -354,6 +397,8 @@ h1 .accent { color: var(--accent); }
 .badge-score { color: var(--score); border-color: var(--score); background: rgba(255, 176, 46, 0.10); }
 .badge-rev { color: var(--rev); border-color: var(--rev); background: rgba(45, 212, 191, 0.10); }
 .card {
+  display: flex;
+  gap: 16px;
   background: linear-gradient(180deg, #181820, #121218);
   border: 1px solid var(--border);
   border-left: 5px solid var(--accent);
@@ -361,6 +406,17 @@ h1 .accent { color: var(--accent); }
   padding: 18px 22px 16px;
   margin: 16px 0;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.card-body { flex: 1 1 auto; min-width: 0; }
+.thumb { flex: 0 0 auto; }
+.thumb img {
+  display: block;
+  width: 88px;
+  height: 123px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #22222c;
 }
 .meta { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .meta .rank { font-weight: 900; font-size: 1.05rem; color: var(--accent); margin-right: 4px; }
@@ -373,7 +429,8 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.78rem; text-align: 
 @media (max-width: 560px) {
   .wrap { padding: 0 12px 40px; }
   header { padding: 22px 0 18px; }
-  .card { padding: 14px 16px 12px; border-radius: 10px; }
+  .card { padding: 14px 16px 12px; border-radius: 10px; gap: 12px; }
+  .thumb img { width: 68px; height: 95px; }
   .card h2 { font-size: 1.03rem; }
   .meta .start { margin-left: 0; }
 }
@@ -412,10 +469,12 @@ function esc(s) {
 function card(w) {
   var start = w.start ? '<span class="start">放送開始：' + esc(w.start) + '</span>' : '';
   var syn = w.synopsis ? '<p class="desc">' + esc(w.synopsis) + '</p>' : '';
-  return '<article class="card"><div class="meta"><span class="rank">' + w.rank + '位</span>'
+  var thumb = w.image ? '<div class="thumb"><img src="' + esc(w.image) + '" alt="' + esc(w.title)
+    + '" loading="lazy" onerror="this.parentNode.style.display=\'none\'"></div>' : '';
+  return '<article class="card">' + thumb + '<div class="card-body"><div class="meta"><span class="rank">' + w.rank + '位</span>'
     + '<span class="badge badge-score">スコア ' + Number(w.score).toFixed(1) + '</span>'
     + '<span class="badge badge-rev">評価レビュー ' + w.reviews + '件</span>' + start + '</div>'
-    + '<h2><a href="' + esc(w.url) + '">' + esc(w.title) + '</a></h2>' + syn + '</article>';
+    + '<h2><a href="' + esc(w.url) + '">' + esc(w.title) + '</a></h2>' + syn + '</div></article>';
 }
 function show(key) {
   var s = DATA[key];
@@ -464,7 +523,54 @@ document.getElementById('seasonSel').addEventListener('change', onPick);
     (BASE / "index.html").write_text(page, encoding="utf-8")
 
 
+def backfill_images():
+    """既存データの各作品に、一覧ページからポスター画像URLだけを補完する。
+
+    点数・件数・あらすじ等の既存データには一切触らない。季節ごとに保存する
+    ので中断しても再開できる。取得に失敗した季節はそのまま残す。
+    使い方: python3 main.py --backfill-images
+    """
+    started = datetime.now(JST)
+    lines = [f"画像補完 開始: {started.isoformat()}"]
+    data_path = BASE / "data.json"
+    data = json.loads(data_path.read_text(encoding="utf-8"))
+    total_filled = 0
+    total_works = 0
+    for k in sorted(data["seasons"].keys()):
+        entry = data["seasons"][k]
+        y, s = entry["year"], entry["season"]
+        try:
+            _urls, imgmap = fetch_season_work_urls(y, s)
+        except Exception as e:
+            log(lines, f"{entry['label']}: 一覧取得失敗のため補完を省略: "
+                       f"{type(e).__name__}: {e}")
+            continue
+        filled = 0
+        for w in entry["works"]:
+            total_works += 1
+            if not w.get("image") and w["url"] in imgmap:
+                w["image"] = imgmap[w["url"]]
+                filled += 1
+        total_filled += filled
+        have = sum(1 for w in entry["works"] if w.get("image"))
+        log(lines, f"{entry['label']}: 画像あり {have}/{len(entry['works'])}作品"
+                   f"（今回 {filled}件 補完）")
+        save_data(data)
+    cur_key = season_key(data["cur_year"], data["cur_season"])
+    write_html(data, cur_key)
+    log(lines, f"画像補完 合計: {total_filled}件 / 全{total_works}作品")
+    log(lines, f"画像補完 終了: {datetime.now(JST).isoformat()}")
+    log_dir = BASE / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"backfill-{started.strftime('%Y%m%d-%H%M%S')}.log"
+    log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"ログ: {log_file}")
+    return 0
+
+
 def main():
+    if "--backfill-images" in sys.argv:
+        return backfill_images()
     started = datetime.now(JST)
     lines = [f"実行開始: {started.isoformat()}"]
     cur_year, cur_season = current_season(started)
