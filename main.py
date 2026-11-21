@@ -699,17 +699,15 @@ function show(key) {
   initClamps();
 }
 function initClamps() {
-  var nodes = document.querySelectorAll('#list .desc.clamp');
+  // 高さは測らない。測るために畳みを外すと、画面の並びが組み替わって
+  // スクロール位置がずれる原因になるため、文字数だけで判定する。
+  // 判定の基準は card() 側の表示判定（100文字超）とそろえてある。
+  var nodes = document.querySelectorAll('#list .desc');
   for (var i = 0; i < nodes.length; i++) {
     var p = nodes[i];
     var btn = p.parentNode.querySelector('.more-btn');
     if (!btn) continue;
-    var clampedH = p.clientHeight;
-    p.classList.remove('clamp');
-    var fullH = p.clientHeight;
-    p.classList.add('clamp');
-    // 表示・非表示は visibility のみで切り替える（高さは変えない）
-    if (fullH > clampedH + 2) btn.classList.add('show');
+    if (p.textContent.length > 100) btn.classList.add('show');
     else btn.classList.remove('show');
   }
 }
@@ -783,7 +781,6 @@ lightbox.addEventListener('click', function() { closeLightbox(); });
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') closeLightbox();
 });
-window.addEventListener('resize', initClamps);
 function onPick() {
   var y = document.getElementById('yearSel').value;
   var s = document.getElementById('seasonSel').value;
