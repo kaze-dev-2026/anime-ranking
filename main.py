@@ -30,6 +30,9 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 TIMEOUT = 30
 SLEEP_SEC = 0.5          # 取得の間隔（通常の利用の範囲に収める）
 TOP_N = 30
+MAX_USER_REVIEWS = 3     # カードに埋め込む利用者レビューの最大件数（新しい順）
+REVIEW_TEXT_MAX = 300    # レビュー本文の最大文字数（超えたら切って続きを案内する）
+REVIEW_SCAN = 12         # 作品ページのレビュー欄で走査する最大件数
 FLOOR_REVIEWS = 10       # 評価レビュー件数の下限（根拠は sources_report.md と実行ログ）
 START_YEAR = 2015
 SITE = "https://filmarks.com"
@@ -87,19 +90,16 @@ def fetch(url):
 
 
 def fetch_detail(url):
-    """作品ページは JSON-LD が冒頭にあるため、必要な部分だけ読んで打ち切る。"""
+    """作品ページを読む。JSON-LD（冒頭）とレビュー欄（後半）の両方が要るため
+    ページ全体を読む。リクエスト回数は従来と同じ1回で、読む量だけ増える。"""
     req = urllib.request.Request(url, headers=UA)
     buf = b""
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        while len(buf) < 96 * 1024:
+        while len(buf) < 1024 * 1024:
             chunk = r.read(16384)
             if not chunk:
                 break
             buf += chunk
-            text = buf.decode("utf-8", "replace")
-            i = text.find("TVSeason")
-            if i >= 0 and "</script>" in text[i:]:
-                break
     return buf.decode("utf-8", "replace")
 
 
@@ -176,10 +176,68 @@ def _find_tvseason(obj):
     return None
 
 
+def _clean_review_text(raw):
+    """レビュー本文のHTML断片をプレーンテキストにする。"""
+    raw = re.sub(r'<a[^>]*>.*?続きを読む</a>', '', raw, flags=re.S)
+    raw = re.sub(r'<br\s*/?>', '\n', raw)
+    raw = re.sub(r'</p>\s*<p[^>]*>', '\n', raw)
+    raw = re.sub(r'<[^>]+>', '', raw)
+    raw = html.unescape(raw)
+    lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in raw.split('\n')]
+    return '\n'.join(ln for ln in lines if ln).strip()
+
+
+def parse_reviews(text):
+    """作品ページの「投稿された感想・評価」欄から利用者レビューを取る。
+
+    戻り値: (レビューのリスト, 走査できたレビュー件数)
+    - 新しい順に最大 MAX_USER_REVIEWS 件。本文は REVIEW_TEXT_MAX 文字で切る。
+    - ネタバレ明記のレビューは本文を保存しない（件数の数えにも含めない形にせず、
+      「走査できた件数」には含める。本文が漏れない事を優先する）。
+    - 点数だけのレビュー（本文なし）は対象外。
+    """
+    idx = text.find('に投稿された感想・評価')
+    if idx < 0:
+        return [], 0
+    chunks = text[idx:].split('<div class="p-mark">')
+    seen = 0
+    out = []
+    for ch in chunks[1:REVIEW_SCAN + 1]:
+        mbody = re.search(r'<div class="p-mark-review">(.*?)</div>', ch, re.S)
+        if not mbody:
+            continue
+        seen += 1
+        if ('このレビューはネタバレを含みます' in ch
+                or 'p-mark__netabare' in ch):
+            continue  # ネタバレは本文を保存しない
+        body = _clean_review_text(mbody.group(1))
+        if not body:
+            continue
+        mscore = re.search(r'c2-rating-s__text">([0-9]+(?:\.[0-9]+)?)<', ch)
+        mdate = re.search(r'<time class="c-media__date" datetime="([^"]+)"', ch)
+        murl = re.search(r'href="(/animes/\d+/\d+/reviews/\d+)"', ch)
+        truncated = '続きを読む' in mbody.group(1)
+        if len(body) > REVIEW_TEXT_MAX:
+            body = body[:REVIEW_TEXT_MAX].rstrip() + '…'
+            truncated = True
+        out.append({
+            "score": float(mscore.group(1)) if mscore else None,
+            "date": mdate.group(1)[:10] if mdate else "",
+            "text": body,
+            "url": (SITE + murl.group(1)) if murl else "",
+            "truncated": truncated,
+        })
+        if len(out) >= MAX_USER_REVIEWS:
+            break
+    return out, seen
+
+
 def parse_detail(text, url):
-    """作品ページの JSON-LD から、題名・点数・評価レビュー件数・あらすじ・開始日を取る。"""
+    """作品ページの JSON-LD から、題名・点数・評価レビュー件数・あらすじ・開始日を取る。
+    同じページのレビュー欄から利用者レビューも取る（追加リクエストなし）。"""
     work = {"url": url, "title": "", "score": None, "reviews": 0,
-            "synopsis": "", "start": "", "image": ""}
+            "synopsis": "", "start": "", "image": "",
+            "user_reviews": [], "reviews_seen": 0}
     for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>',
                          text, re.S):
         try:
@@ -212,6 +270,9 @@ def parse_detail(text, url):
         m = re.search(r"<title>(.*?) - ", text, re.S)
         if m:
             work["title"] = html.unescape(m.group(1)).strip()
+    revs, seen = parse_reviews(text)
+    work["user_reviews"] = revs
+    work["reviews_seen"] = seen
     return work
 
 
@@ -267,6 +328,30 @@ def save_data(data):
     tmp.replace(BASE / "data.json")
 
 
+def reviews_html(w):
+    """「レビューを見る」ボタンとレビュー欄のHTML。レビュー欄は最初は hidden で、
+    読み込み直後に高さが変わらないようにする（開閉はボタンの操作だけ）。"""
+    if not w.get("reviews_seen"):
+        return ""  # レビューが取れていない作品にはボタンを出さない
+    items = ""
+    for r in w.get("user_reviews") or []:
+        sc = f'{r["score"]:.1f}' if r.get("score") is not None else "―"
+        dt = f'<span class="rev-date">{html.escape(r.get("date", ""))}</span>' if r.get("date") else ""
+        more = ""
+        if r.get("truncated") and r.get("url"):
+            more = (f'<div><a class="rev-more" href="{html.escape(r["url"], quote=True)}">'
+                    f'続きはFilmarksで読む</a></div>')
+        items += (f'<div class="review-item"><div class="rev-head">'
+                  f'<span class="rev-score">★ {sc}</span>{dt}</div>'
+                  f'<p class="rev-text">{html.escape(r.get("text", ""))}</p>{more}</div>')
+    if not items:
+        items = (f'<p class="rev-none">ネタバレなしのレビューはまだありません。'
+                 f'<a class="rev-more" href="{html.escape(w["url"], quote=True)}">'
+                 f'Filmarksでレビューを見る</a></p>')
+    return (f'<div><button type="button" class="rev-btn">レビューを見る</button>'
+            f'<div class="reviews" hidden>{items}</div></div>')
+
+
 def card_html(rank, w):
     score = f"{w['score']:.1f}"
     start = f'<span class="start">放送開始：{html.escape(w["start"])}</span>' if w["start"] else ""
@@ -278,6 +363,7 @@ def card_html(rank, w):
         btn_cls = "more-btn show" if len(w["synopsis"]) > 100 else "more-btn"
         syn = (f'<p class="desc clamp">{html.escape(w["synopsis"])}</p>'
                f'<button type="button" class="{btn_cls}">もっと見る</button>')
+    syn += reviews_html(w)
     thumb = ""
     if w.get("image"):
         # 失敗時は画像だけを透明にし、箱（.thumb）は残す。箱ごと消すと
@@ -312,7 +398,9 @@ def write_html(data, cur_key):
                                "score": w["score"], "reviews": w["reviews"],
                                "synopsis": w["synopsis"], "url": w["url"],
                                "start": w["start"],
-                               "image": w.get("image", "")}
+                               "image": w.get("image", ""),
+                               "user_reviews": w.get("user_reviews", []),
+                               "reviews_seen": w.get("reviews_seen")}
                               for i, w in enumerate(ranked)]}
     years = sorted({seasons[k]["year"] for k in keys}, reverse=True)
     year_opts = "".join(f'<option value="{y}">{y}年</option>' for y in years)
@@ -462,6 +550,29 @@ h1 .accent { color: var(--accent); }
 }
 .more-btn.show { visibility: visible; }
 .more-btn:hover { border-color: var(--accent); }
+.rev-btn {
+  margin-top: 8px;
+  padding: 2px 14px;
+  background: none;
+  border: 1px solid var(--rev);
+  border-radius: 999px;
+  color: var(--rev);
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.rev-btn:hover { background: rgba(45, 212, 191, 0.10); }
+.reviews { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.reviews[hidden] { display: none; }
+.review-item { margin: 0 0 12px; }
+.review-item:last-child { margin-bottom: 2px; }
+.rev-head { display: flex; gap: 10px; align-items: center; font-size: 0.8rem; }
+.rev-score { color: var(--score); font-weight: 700; }
+.rev-date { color: var(--muted); }
+.rev-text { margin: 2px 0 0; color: var(--sub); font-size: 0.9rem; white-space: pre-line; }
+.rev-more { color: var(--accent); font-size: 0.82rem; }
+.rev-none { margin: 0; color: var(--sub); font-size: 0.9rem; }
+.rev-none .rev-more { margin-left: 8px; }
 footer { margin-top: 40px; color: var(--muted); font-size: 0.78rem; text-align: center; }
 .thumb img { cursor: zoom-in; }
 #lightbox {
@@ -540,10 +651,30 @@ function esc(s) {
     return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
   });
 }
+function reviewsHtml(w) {
+  if (!w.reviews_seen) return '';
+  var items = '';
+  var rs = w.user_reviews || [];
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    var sc = r.score == null ? '―' : Number(r.score).toFixed(1);
+    var dt = r.date ? '<span class="rev-date">' + esc(r.date) + '</span>' : '';
+    var more = (r.truncated && r.url) ? '<div><a class="rev-more" href="' + esc(r.url) + '">続きはFilmarksで読む</a></div>' : '';
+    items += '<div class="review-item"><div class="rev-head"><span class="rev-score">★ ' + sc + '</span>' + dt
+      + '</div><p class="rev-text">' + esc(r.text) + '</p>' + more + '</div>';
+  }
+  if (!items) {
+    items = '<p class="rev-none">ネタバレなしのレビューはまだありません。'
+      + '<a class="rev-more" href="' + esc(w.url) + '">Filmarksでレビューを見る</a></p>';
+  }
+  return '<div><button type="button" class="rev-btn">レビューを見る</button>'
+    + '<div class="reviews" hidden>' + items + '</div></div>';
+}
 function card(w) {
   var start = w.start ? '<span class="start">放送開始：' + esc(w.start) + '</span>' : '';
   var btnCls = w.synopsis && w.synopsis.length > 100 ? 'more-btn show' : 'more-btn';
   var syn = w.synopsis ? '<p class="desc clamp">' + esc(w.synopsis) + '</p><button type="button" class="' + btnCls + '">もっと見る</button>' : '';
+  syn += reviewsHtml(w);
   var thumb = w.image ? '<div class="thumb"><img src="' + esc(w.image) + '" alt="' + esc(w.title)
     + '" width="300" height="420" loading="lazy" decoding="async" onerror="this.style.visibility=\\'hidden\\'"></div>' : '';
   return '<article class="card">' + thumb + '<div class="card-body"><div class="meta"><span class="rank">' + w.rank + '位</span>'
@@ -593,6 +724,19 @@ document.getElementById('list').addEventListener('click', function(e) {
   } else {
     p.classList.add('clamp');
     btn.textContent = 'もっと見る';
+  }
+});
+document.getElementById('list').addEventListener('click', function(e) {
+  var btn = (e.target && e.target.closest) ? e.target.closest('.rev-btn') : null;
+  if (!btn) return;
+  var box = btn.parentNode.querySelector('.reviews');
+  if (!box) return;
+  if (box.hidden) {
+    box.hidden = false;
+    btn.textContent = '閉じる';
+  } else {
+    box.hidden = true;
+    btn.textContent = 'レビューを見る';
   }
 });
 // ポスター拡大表示（ページ内の仕組みのみ）。季節切り替えで作り直された
@@ -721,9 +865,68 @@ def backfill_images():
     return 0
 
 
+def backfill_reviews():
+    """表示対象（各季節の上位作品）に、作品ページから利用者レビューだけを補完する。
+
+    点数・件数・あらすじ・画像等の既存データには一切触らない（レビュー欄の
+    取得結果 user_reviews / reviews_seen だけを書き足す）。季節ごとに保存する
+    ので中断しても再開できる（reviews_seen が入っている作品は取り直さない）。
+    使い方: python3 main.py --backfill-reviews
+    """
+    started = datetime.now(JST)
+    lines = [f"レビュー補完 開始: {started.isoformat()}"]
+    data_path = BASE / "data.json"
+    data = json.loads(data_path.read_text(encoding="utf-8"))
+    total_target = 0
+    total_with = 0
+    total_fetched = 0
+    for k in sorted(data["seasons"].keys()):
+        entry = data["seasons"][k]
+        ranked = rank_works(entry["works"])
+        targets = [w for w in ranked if "reviews_seen" not in w]
+        total_target += len(ranked)
+        if targets:
+            def _one(u):
+                time.sleep(0.15)
+                text = fetch_detail(u)
+                return parse_reviews(text)
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                results = list(ex.map(
+                    lambda u: (u, _safe_one(_one, u, lines)),
+                    [w["url"] for w in targets]))
+            by_url = dict(results)
+            for w in targets:
+                r = by_url.get(w["url"])
+                if r is None:
+                    continue  # 取得失敗分は次回再実行で取り直す
+                revs, seen = r
+                w["user_reviews"] = revs
+                w["reviews_seen"] = seen
+                total_fetched += 1
+        have = sum(1 for w in ranked if w.get("user_reviews"))
+        total_with += have
+        log(lines, f"{entry['label']}: レビューあり {have}/{len(ranked)}作品"
+                   f"（今回 {len(targets)}作品を取得）")
+        save_data(data)
+    cur_key = season_key(data["cur_year"], data["cur_season"])
+    write_html(data, cur_key)
+    log(lines, f"レビュー補完 合計: 表示対象{total_target}作品 / "
+               f"レビューあり{total_with}作品 / 今回取得{total_fetched}作品")
+    log(lines, f"レビュー補完 終了: {datetime.now(JST).isoformat()}")
+    log_dir = BASE / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"backfill-reviews-{started.strftime('%Y%m%d-%H%M%S')}.log"
+    log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"ログ: {log_file}")
+    return 0
+
+
 def main():
     if "--backfill-images" in sys.argv:
         return backfill_images()
+    if "--backfill-reviews" in sys.argv:
+        return backfill_reviews()
     started = datetime.now(JST)
     lines = [f"実行開始: {started.isoformat()}"]
     cur_year, cur_season = current_season(started)
